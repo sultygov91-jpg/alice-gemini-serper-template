@@ -15,7 +15,7 @@ const GEMINI_TIMEOUT_MS = 3400;
 const SYSTEM_PROMPT = [
   "Ты — Джарвис, спокойный и вежливый голосовой помощник. Обращайся к собеседнику на вы; изредка говори «сэр».",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
+  "По умолчанию отвечай одним коротким предложением, до 25 слов. Если просят подробности, используй до трёх коротких предложений. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
@@ -243,7 +243,7 @@ function voiceResponse(sound, text = "Ответ Джарвиса готов.") 
   return result;
 }
 
-async function createVoiceJob(text, history, name, deadline = 0) {
+async function createVoiceJob(text, history, name, deadline = 0, pending = Promise.resolve(null)) {
   let stage = "GEMINI";
   const started = Date.now();
   try {
@@ -253,6 +253,8 @@ async function createVoiceJob(text, history, name, deadline = 0) {
       ? "К вашим услугам, сэр. Джарвис на связи. Готов помочь с вашим вопросом."
       : fitAliceText(await askGemini(text, history, context, 25000));
     console.info("Jarvis stage complete", { stage, elapsedMs: Date.now() - started });
+    const pendingError = await pending;
+    if (pendingError) throw pendingError;
     stage = "FISH";
     const audio = await fetch("https://api.fish.audio/v1/tts", {
       method: "POST", signal: AbortSignal.timeout(20000),
@@ -265,14 +267,14 @@ async function createVoiceJob(text, history, name, deadline = 0) {
     stage = "YANDEX_UPLOAD";
     if (!bytes.byteLength || bytes.byteLength > 5 * 1024 * 1024) throw new Error("VOICE_SIZE_INVALID");
     let sound = await uploadSound(bytes, `${name}ready.mp3`, 3000, 2);
-    console.info("Jarvis audio uploaded");
+    console.info("Jarvis audio uploaded", { elapsedMs: Date.now() - started });
     while (!sound.isProcessed && !sound.error && deadline - Date.now() > 350) {
       await new Promise(resolve => setTimeout(resolve, 200));
-      const status = await fetchJson(SOUNDS_URL, {
+      const status = await fetchJson(`${SOUNDS_URL}/${sound.id}`, {
         headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
       }, Math.max(100, deadline - Date.now())).catch(() => null);
       if (!status?.response.ok) break;
-      sound = (Array.isArray(status.data.sounds) ? status.data.sounds : []).find(item => item.id === sound.id) || sound;
+      sound = status.data.sound || sound;
     }
     return voiceResponse(sound, answer);
   } catch (error) {
@@ -374,9 +376,11 @@ export default async function handler(req, res) {
       }
       const name = sessionPrefix(sessionId) + Date.now() + "-";
       // A durable pending marker prevents a later request from replaying an older answer.
-      await uploadSound(silentWav(), `${name}pending.wav`, 1300, 1);
+      // Generate text while the durable marker is being uploaded.
+      const pending = uploadSound(silentWav(), `${name}pending.wav`, 1300, 1)
+        .then(() => null, error => error);
       const deadline = startedAt + 3500;
-      const job = createVoiceJob(text, oldHistory, name, deadline);
+      const job = createVoiceJob(text, oldHistory, name, deadline, pending);
       waitUntil(job);
       const immediate = await withinDeadline(job, deadline);
       if (immediate) return res.status(200).json(immediate);
