@@ -211,12 +211,18 @@ function silentWav() {
   return b;
 }
 
-async function uploadSound(bytes, name, timeout = 5000) {
+async function uploadSound(bytes, name, timeout = 5000, retries = 0) {
   const form = new FormData();
   form.append("file", new Blob([bytes]), name);
   const { response, data } = await fetchJson(SOUNDS_URL, {
     method: "POST", headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }, body: form
   }, timeout);
+  if (response.status === 429 && retries > 0) {
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(5000, retryAfter * 1000) : 2000;
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return uploadSound(bytes, name, timeout, retries - 1);
+  }
   if (!response.ok || !data.sound?.id) throw new Error(`YANDEX_AUDIO_HTTP_${response.status}`);
   return data.sound;
 }
@@ -236,7 +242,7 @@ async function createVoiceJob(text, history, name) {
     if (!audio.ok) throw new Error(`FISH_HTTP_${audio.status}`);
     const bytes = await audio.arrayBuffer();
     if (!bytes.byteLength || bytes.byteLength > 5 * 1024 * 1024) throw new Error("VOICE_SIZE_INVALID");
-    await uploadSound(bytes, `${name}ready.mp3`);
+    await uploadSound(bytes, `${name}ready.mp3`, 3000, 2);
     console.info("Jarvis audio uploaded");
   } catch (error) {
     const code = /^(FISH_HTTP_\d+|YANDEX_AUDIO_HTTP_\d+|GEMINI_[A-Z_]+|VOICE_SIZE_INVALID)$/.test(error.message)
