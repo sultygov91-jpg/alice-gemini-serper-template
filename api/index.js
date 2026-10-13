@@ -13,7 +13,7 @@ const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 3400;
 
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
+  "Ты — Джарвис, спокойный и вежливый голосовой помощник. Обращайся к собеседнику на вы; изредка говори «сэр».",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
@@ -219,7 +219,7 @@ async function uploadSound(bytes, name, timeout = 5000, retries = 0) {
   }, timeout);
   if (response.status === 429 && retries > 0) {
     const retryAfter = Number(response.headers.get("retry-after"));
-    const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(5000, retryAfter * 1000) : 2000;
+    const delay = timeout <= 1300 ? 250 : Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(5000, retryAfter * 1000) : 2000;
     await new Promise(resolve => setTimeout(resolve, delay));
     return uploadSound(bytes, name, timeout, retries - 1);
   }
@@ -326,6 +326,11 @@ export default async function handler(req, res) {
   const oldHistory = safeHistory(body?.state?.session?.history);
 
   if (!text) {
+    if (process.env.FISH_API_KEY && process.env.YANDEX_DIALOGS_TOKEN) {
+      const greeting = aliceResponse("К вашим услугам, сэр. Джарвис на связи. Готов помочь с вашим вопросом.");
+      greeting.response.tts = `<speaker audio="dialogs-upload/${SKILL_ID}/46696cac-4241-433b-a682-185293a9f52d.opus">`;
+      return res.status(200).json(greeting);
+    }
     return res.status(200).json(aliceResponse(
       "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
       false,
@@ -344,12 +349,12 @@ export default async function handler(req, res) {
       }
       const name = sessionPrefix(sessionId) + Date.now() + "-";
       // A durable pending marker prevents a later request from replaying an older answer.
-      await uploadSound(silentWav(), `${name}pending.wav`, 1800);
+      await uploadSound(silentWav(), `${name}pending.wav`, 1300, 1);
       waitUntil(createVoiceJob(text, oldHistory, name));
       return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Через несколько секунд скажите: готово."));
     } catch (error) {
       console.warn("Jarvis request failed:", error.name === "AbortError" ? "TIMEOUT" : error.message);
-      return res.status(200).json(aliceResponse("Не удалось связаться с сервисом озвучки. Попробуйте ещё раз, сэр."));
+      return res.status(200).json(aliceResponse("Яндекс временно не принял запрос на запись, сэр. Повторите вопрос немного позже."));
     }
   }
 
