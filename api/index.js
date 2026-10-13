@@ -333,6 +333,23 @@ async function readVoiceJob(sessionId) {
 }
 
 
+function deliveryCode(id) {
+  return String(1000000000 + parseInt(createHmac("sha256", process.env.YANDEX_DIALOGS_TOKEN).update(id).digest("hex").slice(0, 8), 16));
+}
+
+async function deliveredVoice(text) {
+  const code = text.replace(/\s/g, "");
+  if (!/^\d{10}$/.test(code)) return null;
+  const { response, data } = await fetchJson(SOUNDS_URL, {
+    headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
+  }, 2600);
+  if (!response.ok) return aliceResponse("Не удалось получить запись, сэр. Повторите вопрос.");
+  const sound = (data.sounds || []).find(s =>
+    /^auto-jarvis-[a-f0-9]{24}-\d{13}-ready\.mp3$/.test(s.originalName || "") &&
+    Number(s.originalName.split("-")[3]) > Date.now() - 120000 && deliveryCode(s.id) === code);
+  return voiceResponse(sound) || aliceResponse("Запись уже недоступна, сэр. Задайте вопрос ещё раз.");
+}
+
 async function bridgeStatus(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const key = String(req.headers["x-jarvis-bridge-key"] || "");
@@ -350,7 +367,7 @@ async function bridgeStatus(req, res) {
   const latest = recent[0]?.created;
   const ready = recent.find(s => s.created === latest && s.originalName.endsWith("-ready.mp3") && s.isProcessed && !s.error);
   return res.status(200).json({ job: ready ? { id: ready.id, created: ready.created,
-    tts: `<speaker audio="dialogs-upload/${SKILL_ID}/${ready.id}.opus">` } : null });
+    command: `СКАЖИ НАВЫКУ МОЙ ДЖАРВИС ${deliveryCode(ready.id)}` } : null });
 }
 
 export default async function handler(req, res) {
@@ -373,6 +390,11 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
+
+  if (body.session?.skill_id === SKILL_ID && process.env.YANDEX_DIALOGS_TOKEN && /^\d{10}$/.test(text.replace(/\s/g, ""))) {
+    try { return res.status(200).json(await deliveredVoice(text)); }
+    catch { return res.status(200).json(aliceResponse("Не удалось получить запись, сэр. Повторите вопрос.")); }
+  }
 
   if (!text) {
     if (process.env.FISH_API_KEY && process.env.YANDEX_DIALOGS_TOKEN) {
