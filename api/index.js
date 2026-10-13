@@ -1,5 +1,5 @@
 import { waitUntil } from "@vercel/functions";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const SKILL_ID = "74dc5f73-86f3-4269-b170-2b3aaa07f0f9";
@@ -332,7 +332,29 @@ async function readVoiceJob(sessionId) {
   return aliceResponse("Ответ ещё готовится, сэр. Через несколько секунд скажите: готово.");
 }
 
+
+async function bridgeStatus(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+  const key = String(req.headers["x-jarvis-bridge-key"] || "");
+  if (createHash("sha256").update(key).digest("hex") !== "2d9fe6c51c4f33ff82b054f2de1ae8b5e600bc913f3c3de921e283c365cab9e6") {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const { response, data } = await fetchJson(SOUNDS_URL, {
+    headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
+  }, 5000);
+  if (!response.ok) return res.status(503).json({ error: "Audio store unavailable" });
+  const recent = (data.sounds || []).filter(s =>
+    /^auto-jarvis-[a-f0-9]{24}-\d{13}-(pending\.wav|ready\.mp3|error-[A-Z_0-9]+\.wav)$/.test(s.originalName || "")
+  ).map(s => ({ ...s, created: Number(s.originalName.split("-")[3]) }))
+    .filter(s => s.created > Date.now() - 120000).sort((a,b) => b.created-a.created);
+  const latest = recent[0]?.created;
+  const ready = recent.find(s => s.created === latest && s.originalName.endsWith("-ready.mp3") && s.isProcessed && !s.error);
+  return res.status(200).json({ job: ready ? { id: ready.id, created: ready.created,
+    tts: `<speaker audio="dialogs-upload/${SKILL_ID}/${ready.id}.opus">` } : null });
+}
+
 export default async function handler(req, res) {
+  if (req.method === "GET" && req.query?.bridge === "1") return bridgeStatus(req, res);
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
@@ -374,17 +396,11 @@ export default async function handler(req, res) {
       if (/^(готово|готов|ответ|продолжай|дальше|да|повтори)[.!?\s]*$/i.test(text)) {
         return res.status(200).json(await readVoiceJob(sessionId));
       }
-      const name = sessionPrefix(sessionId) + Date.now() + "-";
-      // A durable pending marker prevents a later request from replaying an older answer.
-      // Generate text while the durable marker is being uploaded.
+      const name = "auto-" + sessionPrefix(sessionId) + Date.now() + "-";
       const pending = uploadSound(silentWav(), `${name}pending.wav`, 1300, 1)
         .then(() => null, error => error);
-      const deadline = startedAt + 3500;
-      const job = createVoiceJob(text, oldHistory, name, deadline, pending);
-      waitUntil(job);
-      const immediate = await withinDeadline(job, deadline);
-      if (immediate) return res.status(200).json(immediate);
-      return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Через несколько секунд скажите: готово."));
+      waitUntil(createVoiceJob(text, oldHistory, name, 0, pending));
+      return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Он прозвучит автоматически.", true));
     } catch (error) {
       console.warn("Jarvis request failed:", error.name === "AbortError" ? "TIMEOUT" : error.message);
       return res.status(200).json(aliceResponse("Яндекс временно не принял запрос на запись, сэр. Повторите вопрос немного позже."));
