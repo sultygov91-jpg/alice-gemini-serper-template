@@ -1,4 +1,10 @@
+import { waitUntil } from "@vercel/functions";
+import { createHmac } from "node:crypto";
+
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const SKILL_ID = "74dc5f73-86f3-4269-b170-2b3aaa07f0f9";
+const VOICE_ID = "a03438d6fdf34d61b72f0ec0d443a0af";
+const SOUNDS_URL = `https://dialogs.yandex.net/api/v1/skills/${SKILL_ID}/sounds`;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -145,7 +151,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
 
   if (!response.ok) {
@@ -190,6 +196,87 @@ function errorForUser(error) {
   }
 }
 
+function sessionPrefix(sessionId) {
+  return "jarvis-" + createHmac("sha256", process.env.YANDEX_DIALOGS_TOKEN)
+    .update(sessionId).digest("hex").slice(0, 24) + "-";
+}
+
+function silentWav() {
+  const b = Buffer.alloc(2044);
+  b.write("RIFF"); b.writeUInt32LE(b.length - 8, 4); b.write("WAVEfmt ", 8);
+  b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22);
+  b.writeUInt32LE(16000, 24); b.writeUInt32LE(32000, 28);
+  b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write("data", 36);
+  b.writeUInt32LE(b.length - 44, 40);
+  return b;
+}
+
+async function uploadSound(bytes, name, timeout = 5000) {
+  const form = new FormData();
+  form.append("file", new Blob([bytes]), name);
+  const { response, data } = await fetchJson(SOUNDS_URL, {
+    method: "POST", headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }, body: form
+  }, timeout);
+  if (!response.ok || !data.sound?.id) throw new Error(`YANDEX_AUDIO_HTTP_${response.status}`);
+  return data.sound;
+}
+
+async function createVoiceJob(text, history, name) {
+  try {
+    let context = "";
+    if (isSearchIntent(text) && process.env.SERPER_API_KEY) context = await searchWeb(text, 600);
+    const answer = /^(проверка голоса|проверь голос)$/i.test(text)
+      ? "К вашим услугам, сэр. Джарвис на связи. Готов помочь с вашим вопросом."
+      : fitAliceText(await askGemini(text, history, context, 25000));
+    const audio = await fetch("https://api.fish.audio/v1/tts", {
+      method: "POST", signal: AbortSignal.timeout(20000),
+      headers: { Authorization: `Bearer ${process.env.FISH_API_KEY}`, "Content-Type": "application/json", model: "s2.1-pro-free" },
+      body: JSON.stringify({ text: answer, reference_id: VOICE_ID, format: "mp3", latency: "balanced" })
+    });
+    if (!audio.ok) throw new Error(`FISH_HTTP_${audio.status}`);
+    const bytes = await audio.arrayBuffer();
+    if (!bytes.byteLength || bytes.byteLength > 5 * 1024 * 1024) throw new Error("VOICE_SIZE_INVALID");
+    await uploadSound(bytes, `${name}ready.mp3`);
+    console.info("Jarvis audio uploaded");
+  } catch (error) {
+    const code = /^(FISH_HTTP_\d+|YANDEX_AUDIO_HTTP_\d+|GEMINI_[A-Z_]+|VOICE_SIZE_INVALID)$/.test(error.message)
+      ? error.message : "TIMEOUT";
+    console.warn("Jarvis background response failed:", code);
+    // Persist a small status marker in the same resource store as the audio.
+    // It is never played. No conversation text or account identifiers in filenames.
+    await uploadSound(silentWav(), `${name}error-${code}.wav`).catch(() => {});
+  }
+}
+
+function selectLatestVoiceJob(sounds, prefix) {
+  const own = sounds.filter(s => typeof s.originalName === "string" && s.originalName.startsWith(prefix));
+  const latest = own.map(s => s.originalName.slice(prefix.length, prefix.length + 13))
+    .filter(s => /^\d{13}$/.test(s)).sort().at(-1);
+  return latest ? own.filter(s => s.originalName.startsWith(prefix + latest + "-")) : [];
+}
+
+async function readVoiceJob(sessionId) {
+  const { response, data } = await fetchJson(SOUNDS_URL, {
+    headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
+  }, 2500);
+  if (!response.ok) throw new Error("VOICE_STATUS_UNAVAILABLE");
+  const files = selectLatestVoiceJob(Array.isArray(data.sounds) ? data.sounds : [], sessionPrefix(sessionId));
+  const failed = files.find(s => s.originalName.includes("-error-"));
+  if (failed) {
+    const text = failed.originalName.includes("FISH_HTTP_402")
+      ? "Сервис озвучки запросил оплату. Бесплатный голос сейчас недоступен."
+      : "Не удалось подготовить озвученный ответ, сэр. Попробуйте задать вопрос ещё раз.";
+    return aliceResponse(text);
+  }
+  const ready = files.find(s => s.originalName.endsWith("-ready.mp3") && s.isProcessed && !s.error);
+  if (ready && /^[a-f0-9-]{36}$/i.test(ready.id)) {
+    const result = aliceResponse("Ответ Джарвиса готов.");
+    result.response.tts = `<speaker audio="dialogs-upload/${SKILL_ID}/${ready.id}.opus">`;
+    return result;
+  }
+  return aliceResponse("Ответ ещё готовится, сэр. Через несколько секунд скажите: готово.");
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
@@ -216,6 +303,26 @@ export default async function handler(req, res) {
       false,
       oldHistory
     ));
+  }
+
+  if (process.env.FISH_API_KEY && process.env.YANDEX_DIALOGS_TOKEN) {
+    const sessionId = body.session?.session_id;
+    if (!sessionId || body.session?.skill_id !== SKILL_ID) {
+      return res.status(200).json(aliceResponse("Запустите навык через Алису, сэр."));
+    }
+    try {
+      if (/^(готово|готов|ответ|продолжай|дальше|да|повтори)[.!?\s]*$/i.test(text)) {
+        return res.status(200).json(await readVoiceJob(sessionId));
+      }
+      const name = sessionPrefix(sessionId) + Date.now() + "-";
+      // A durable pending marker prevents a later request from replaying an older answer.
+      await uploadSound(silentWav(), `${name}pending.wav`, 1800);
+      waitUntil(createVoiceJob(text, oldHistory, name));
+      return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Через несколько секунд скажите: готово."));
+    } catch (error) {
+      console.warn("Jarvis request failed:", error.name === "AbortError" ? "TIMEOUT" : error.message);
+      return res.status(200).json(aliceResponse("Не удалось связаться с сервисом озвучки. Попробуйте ещё раз, сэр."));
+    }
   }
 
   try {
@@ -246,4 +353,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, selectLatestVoiceJob };
