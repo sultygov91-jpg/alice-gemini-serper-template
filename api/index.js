@@ -228,12 +228,16 @@ async function uploadSound(bytes, name, timeout = 5000, retries = 0) {
 }
 
 async function createVoiceJob(text, history, name) {
+  let stage = "GEMINI";
+  const started = Date.now();
   try {
     let context = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) context = await searchWeb(text, 600);
     const answer = /^(проверка голоса|проверь голос)$/i.test(text)
       ? "К вашим услугам, сэр. Джарвис на связи. Готов помочь с вашим вопросом."
       : fitAliceText(await askGemini(text, history, context, 25000));
+    console.info("Jarvis stage complete", { stage, elapsedMs: Date.now() - started });
+    stage = "FISH";
     const audio = await fetch("https://api.fish.audio/v1/tts", {
       method: "POST", signal: AbortSignal.timeout(20000),
       headers: { Authorization: `Bearer ${process.env.FISH_API_KEY}`, "Content-Type": "application/json", model: "s2.1-pro-free" },
@@ -241,12 +245,14 @@ async function createVoiceJob(text, history, name) {
     });
     if (!audio.ok) throw new Error(`FISH_HTTP_${audio.status}`);
     const bytes = await audio.arrayBuffer();
+    console.info("Jarvis stage complete", { stage, elapsedMs: Date.now() - started, bytes: bytes.byteLength });
+    stage = "YANDEX_UPLOAD";
     if (!bytes.byteLength || bytes.byteLength > 5 * 1024 * 1024) throw new Error("VOICE_SIZE_INVALID");
     await uploadSound(bytes, `${name}ready.mp3`, 3000, 2);
     console.info("Jarvis audio uploaded");
   } catch (error) {
     const code = /^(FISH_HTTP_\d+|YANDEX_AUDIO_HTTP_\d+|GEMINI_[A-Z_]+|VOICE_SIZE_INVALID)$/.test(error.message)
-      ? error.message : "TIMEOUT";
+      ? error.message : `${stage}_${error.name === "AbortError" || error.name === "TimeoutError" ? "TIMEOUT" : "NETWORK_ERROR"}`;
     console.warn("Jarvis background response failed:", code);
     // Persist a small status marker in the same resource store as the audio.
     // It is never played. No conversation text or account identifiers in filenames.
