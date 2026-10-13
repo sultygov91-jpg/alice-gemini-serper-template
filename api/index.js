@@ -393,14 +393,12 @@ export default async function handler(req, res) {
       return res.status(200).json(aliceResponse("Запустите навык через Алису, сэр."));
     }
     try {
-      if (/^(готово|готов|ответ|продолжай|дальше|да|повтори)[.!?\s]*$/i.test(text)) {
-        return res.status(200).json(await readVoiceJob(sessionId));
-      }
+
       const name = "auto-" + sessionPrefix(sessionId) + Date.now() + "-";
       const pending = uploadSound(silentWav(), `${name}pending.wav`, 1300, 1)
         .then(() => null, error => error);
       waitUntil(createVoiceJob(text, oldHistory, name, 0, pending));
-      return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Он прозвучит автоматически.", true));
+      return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Он прозвучит автоматически.", false));
     } catch (error) {
       console.warn("Jarvis request failed:", error.name === "AbortError" ? "TIMEOUT" : error.message);
       return res.status(200).json(aliceResponse("Яндекс временно не принял запрос на запись, сэр. Повторите вопрос немного позже."));
