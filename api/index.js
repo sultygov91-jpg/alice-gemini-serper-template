@@ -268,14 +268,24 @@ function selectLatestVoiceJob(sounds, prefix) {
 }
 
 async function readVoiceJob(sessionId) {
-  const { response, data } = await fetchJson(SOUNDS_URL, {
-    headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
-  }, 2500);
-  if (!response.ok) throw new Error("VOICE_STATUS_UNAVAILABLE");
+  let response, data;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    ({ response, data } = await fetchJson(SOUNDS_URL, {
+      headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
+    }, 1300));
+    if (response.status !== 429 && response.status < 500) break;
+    if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  if (!response.ok) {
+    console.warn("Jarvis status failed", { status: response.status });
+    return aliceResponse("Яндекс пока не отдаёт готовую запись, сэр. Попробуйте сказать «готово» немного позже.");
+  }
   const files = selectLatestVoiceJob(Array.isArray(data.sounds) ? data.sounds : [], sessionPrefix(sessionId));
   const failed = files.find(s => s.originalName.includes("-error-"));
   if (failed) {
-    const text = failed.originalName.includes("FISH_HTTP_402")
+    const text = failed.originalName.includes("GEMINI_")
+      ? "Не удалось получить ответ Gemini, сэр. Попробуйте задать вопрос ещё раз."
+      : failed.originalName.includes("FISH_HTTP_402")
       ? "Сервис озвучки запросил оплату. Бесплатный голос сейчас недоступен."
       : "Не удалось подготовить озвученный ответ, сэр. Попробуйте задать вопрос ещё раз.";
     return aliceResponse(text);
@@ -286,6 +296,12 @@ async function readVoiceJob(sessionId) {
     result.response.tts = `<speaker audio="dialogs-upload/${SKILL_ID}/${ready.id}.opus">`;
     return result;
   }
+  if (!files.length) return aliceResponse("У меня пока нет вопроса в этом разговоре, сэр. Задайте его.");
+  if (files.some(s => s.originalName.endsWith("-ready.mp3") && s.error)) {
+    return aliceResponse("Яндекс не смог обработать запись, сэр. Задайте вопрос ещё раз.");
+  }
+  const createdAt = Number(files[0].originalName.slice(sessionPrefix(sessionId).length, sessionPrefix(sessionId).length + 13));
+  if (Date.now() - createdAt > 120000) return aliceResponse("Подготовка ответа прервалась, сэр. Задайте вопрос ещё раз.");
   return aliceResponse("Ответ ещё готовится, сэр. Через несколько секунд скажите: готово.");
 }
 
