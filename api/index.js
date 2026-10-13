@@ -227,7 +227,23 @@ async function uploadSound(bytes, name, timeout = 5000, retries = 0) {
   return data.sound;
 }
 
-async function createVoiceJob(text, history, name) {
+async function withinDeadline(work, deadline) {
+  let timer;
+  try {
+    return await Promise.race([work, new Promise(resolve => {
+      timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now()));
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+function voiceResponse(sound, text = "Ответ Джарвиса готов.") {
+  if (!sound?.isProcessed || sound.error || !/^[a-f0-9-]{36}$/i.test(sound.id)) return null;
+  const result = aliceResponse(text);
+  result.response.tts = `<speaker audio="dialogs-upload/${SKILL_ID}/${sound.id}.opus">`;
+  return result;
+}
+
+async function createVoiceJob(text, history, name, deadline = 0) {
   let stage = "GEMINI";
   const started = Date.now();
   try {
@@ -248,8 +264,17 @@ async function createVoiceJob(text, history, name) {
     console.info("Jarvis stage complete", { stage, elapsedMs: Date.now() - started, bytes: bytes.byteLength });
     stage = "YANDEX_UPLOAD";
     if (!bytes.byteLength || bytes.byteLength > 5 * 1024 * 1024) throw new Error("VOICE_SIZE_INVALID");
-    await uploadSound(bytes, `${name}ready.mp3`, 3000, 2);
+    let sound = await uploadSound(bytes, `${name}ready.mp3`, 3000, 2);
     console.info("Jarvis audio uploaded");
+    while (!sound.isProcessed && !sound.error && deadline - Date.now() > 350) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const status = await fetchJson(SOUNDS_URL, {
+        headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
+      }, Math.max(100, deadline - Date.now())).catch(() => null);
+      if (!status?.response.ok) break;
+      sound = (Array.isArray(status.data.sounds) ? status.data.sounds : []).find(item => item.id === sound.id) || sound;
+    }
+    return voiceResponse(sound, answer);
   } catch (error) {
     const code = /^(FISH_HTTP_\d+|YANDEX_AUDIO_HTTP_\d+|GEMINI_[A-Z_]+|VOICE_SIZE_INVALID)$/.test(error.message)
       ? error.message : `${stage}_${error.name === "AbortError" || error.name === "TimeoutError" ? "TIMEOUT" : "NETWORK_ERROR"}`;
@@ -350,7 +375,11 @@ export default async function handler(req, res) {
       const name = sessionPrefix(sessionId) + Date.now() + "-";
       // A durable pending marker prevents a later request from replaying an older answer.
       await uploadSound(silentWav(), `${name}pending.wav`, 1300, 1);
-      waitUntil(createVoiceJob(text, oldHistory, name));
+      const deadline = startedAt + 3500;
+      const job = createVoiceJob(text, oldHistory, name, deadline);
+      waitUntil(job);
+      const immediate = await withinDeadline(job, deadline);
+      if (immediate) return res.status(200).json(immediate);
       return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Через несколько секунд скажите: готово."));
     } catch (error) {
       console.warn("Jarvis request failed:", error.name === "AbortError" ? "TIMEOUT" : error.message);
@@ -386,4 +415,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, selectLatestVoiceJob };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, selectLatestVoiceJob, withinDeadline, voiceResponse };
