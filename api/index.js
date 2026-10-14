@@ -1,4 +1,4 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gemini-3.1-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -146,7 +146,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         })),
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 400
+          maxOutputTokens: 280,
+          thinkingConfig: { thinkingLevel: "minimal" }
         }
       })
     },
@@ -155,7 +156,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error("Gemini request failed", { status, model, code: data?.error?.status });
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
@@ -200,7 +201,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     // Old local bridges can poll harmlessly; no audio jobs are created anymore.
     return res.status(200).json(req.query?.bridge === "1" ? { job: null, mode: "native" } :
-      { ok: true, service: "alice-gemini-serper", mode: "native", revision: "gemini-conversation-v1" });
+      { ok: true, service: "alice-gemini-serper", mode: "native", revision: "gemini-conversation-v2" });
   }
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
