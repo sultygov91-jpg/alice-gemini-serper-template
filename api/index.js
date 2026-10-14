@@ -350,16 +350,35 @@ async function deliveredVoice(text) {
   return voiceResponse(sound) || aliceResponse("Запись уже недоступна, сэр. Задайте вопрос ещё раз.");
 }
 
+let soundsCache = null;
+let soundsCacheUntil = 0;
+let soundsInFlight = null;
+async function cachedSounds() {
+  if (soundsCache && Date.now() < soundsCacheUntil) return soundsCache;
+  if (soundsInFlight) return soundsInFlight;
+  soundsInFlight = fetchJson(SOUNDS_URL, {
+    headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
+  }, 5000).then(result => {
+    soundsCache = result;
+    const retry = Number(result.response.headers.get("retry-after"));
+    soundsCacheUntil = Date.now() + (result.response.ok ? 10000 : Math.min(60000, Math.max(15000, (retry || 30) * 1000)));
+    if (!result.response.ok) console.warn("Audio store read failed", { status: result.response.status });
+    return result;
+  }).finally(() => { soundsInFlight = null; });
+  return soundsInFlight;
+}
+
 async function bridgeStatus(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const key = String(req.headers["x-jarvis-bridge-key"] || "");
   if (createHash("sha256").update(key).digest("hex") !== "2d9fe6c51c4f33ff82b054f2de1ae8b5e600bc913f3c3de921e283c365cab9e6") {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  const { response, data } = await fetchJson(SOUNDS_URL, {
-    headers: { Authorization: `OAuth ${process.env.YANDEX_DIALOGS_TOKEN}` }
-  }, 5000);
-  if (!response.ok) return res.status(503).json({ error: "Audio store unavailable" });
+  const { response, data } = await cachedSounds();
+  if (!response.ok) {
+    res.setHeader("Retry-After", "30");
+    return res.status(503).json({ error: "Audio store unavailable", upstreamStatus: response.status });
+  }
   const recent = (data.sounds || []).filter(s =>
     /^auto-jarvis-[a-f0-9]{24}-\d{13}-(pending\.wav|ready\.mp3|error-[A-Z_0-9]+\.wav)$/.test(s.originalName || "")
   ).map(s => ({ ...s, created: Number(s.originalName.split("-")[3]) }))
