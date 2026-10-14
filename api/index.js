@@ -436,9 +436,7 @@ export default async function handler(req, res) {
     try {
 
       const name = "auto-" + sessionPrefix(sessionId) + Date.now() + "-";
-      const pending = uploadSound(silentWav(), `${name}pending.wav`, 1300, 1)
-        .then(() => null, error => error);
-      waitUntil(createVoiceJob(text, oldHistory, name, 0, pending));
+      waitUntil(createVoiceJob(text, oldHistory, name));
       return res.status(200).json(aliceResponse("Готовлю ответ, сэр. Он прозвучит автоматически.", false));
     } catch (error) {
       console.warn("Jarvis request failed:", error.name === "AbortError" ? "TIMEOUT" : error.message);
