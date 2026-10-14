@@ -8,7 +8,7 @@ const GEMINI_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT = [
   "Ты — разговорный помощник на базе Gemini внутри навыка Алисы. Общайся по-русски, естественно, на ты, без роли дворецкого и обращения сэр.",
-  "Обычно отвечай двумя–четырьмя короткими предложениями. Учитывай историю и продолжай обсуждение без повторного приветствия. По просьбе раскрывай тему подробнее, но ответ должен помещаться в 900 символов.",
+  "Обычно отвечай двумя–тремя короткими предложениями. Учитывай историю и продолжай обсуждение без повторного приветствия. По просьбе раскрывай тему подробнее, но ответ должен помещаться в 900 символов.",
   "Не используй Markdown, таблицы и длинные вступления. Не добавляй нравоучений или предупреждений без необходимости. Обычная ненормативная лексика собеседника сама по себе не повод отказывать в ответе.",
   "Если не знаешь, скажи об этом. Не выдумывай новости и результаты поиска. Не обещай выполнить действия, которых ты не выполняешь."
 ].join(" ");
@@ -146,7 +146,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         })),
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 280,
+          maxOutputTokens: 200,
           thinkingConfig: { thinkingLevel: "minimal" }
         }
       })
@@ -196,12 +196,26 @@ function errorForUser(error) {
   }
 }
 
+// Best-effort cloud memory when Yandex state storage is unavailable.
+// Kept only in this running instance, expires after 30 minutes; never persisted to logs.
+const recentSessions = new Map();
+function sessionKey(body) {
+  const session = body.session;
+  return session?.session_id && session?.skill_id ? `${session.skill_id}:${session.session_id}` : null;
+}
+function remember(key, history) {
+  const now = Date.now();
+  for (const [id, entry] of recentSessions) if (entry.expires <= now) recentSessions.delete(id);
+  if (!key) return;
+  if (recentSessions.size >= 500 && !recentSessions.has(key)) recentSessions.delete(recentSessions.keys().next().value);
+  recentSessions.set(key, { history: safeHistory(history), expires: now + 30 * 60 * 1000 });
+}
 export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
   if (req.method === "GET") {
     // Old local bridges can poll harmlessly; no audio jobs are created anymore.
     return res.status(200).json(req.query?.bridge === "1" ? { job: null, mode: "native" } :
-      { ok: true, service: "alice-gemini-serper", mode: "native", revision: "gemini-conversation-v2" });
+      { ok: true, service: "alice-gemini-serper", mode: "native", revision: "gemini-conversation-v3" });
   }
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
@@ -211,12 +225,18 @@ export default async function handler(req, res) {
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body.request?.command || body.request?.original_utterance || "").trim();
-  const history = safeHistory(body.state?.session?.history);
+  const key = sessionKey(body);
+  if (body.session?.new && key) recentSessions.delete(key);
+  const cached = key && recentSessions.get(key);
+  const history = safeHistory(Array.isArray(body.state?.session?.history) ? body.state.session.history :
+    cached && cached.expires > Date.now() ? cached.history : []);
   if (!text) return res.status(200).json(aliceResponse("Привет! Gemini на связи. О чём поговорим?", false, history));
   if (/^(выход|выйти|заверши разговор|закрой навык|хватит|стоп)[.!?]*$/i.test(text)) {
+    if (key) recentSessions.delete(key);
     return res.status(200).json(aliceResponse("До встречи!", true));
   }
   if (/^(забудь разговор|очисти историю|начнём заново|начнем заново)[.!?]*$/i.test(text)) {
+    if (key) recentSessions.delete(key);
     return res.status(200).json(aliceResponse("Начинаем заново. О чём поговорим?"));
   }
   try {
@@ -227,9 +247,9 @@ export default async function handler(req, res) {
     const answer = await askGemini(text, history, searchContext, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 200));
     const spoken = fitAliceText(answer);
     console.info("Gemini conversation completed", { durationMs: Date.now() - startedAt });
-    return res.status(200).json(aliceResponse(spoken, false, [
-      ...history, { role: "user", text }, { role: "model", text: spoken }
-    ]));
+    const nextHistory = [...history, { role: "user", text }, { role: "model", text: spoken }];
+    remember(key, nextHistory);
+    return res.status(200).json(aliceResponse(spoken, false, nextHistory));
   } catch (error) {
     const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Gemini conversation fallback", { reason: safeError?.message, durationMs: Date.now() - startedAt });
